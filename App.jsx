@@ -3,7 +3,7 @@ import { useState, useReducer, useEffect, useCallback } from "react";
 // ── SHAREPOINT CONFIG ─────────────────────────────────────────────────────────
 const SP_SITE = "https://clavijocapital.sharepoint.com/sites/GESTIONPROYECTOS";
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
-const CLIENT_ID = "YOUR_CLIENT_ID"; // Se rellena tras registro en Azure
+const CLIENT_ID = "5c95b5c3-d7d8-4f2a-9f73-4f697d6f9a5e";
 const SCOPES = ["Sites.ReadWrite.All", "User.Read"];
 
 const SP_LISTS = {
