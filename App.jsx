@@ -1,0 +1,1209 @@
+import { useState, useReducer, useEffect, useCallback } from "react";
+
+// ── SHAREPOINT CONFIG ─────────────────────────────────────────────────────────
+const SP_SITE = "https://clavijocapital.sharepoint.com/sites/GESTIONPROYECTOS";
+const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+const CLIENT_ID = "YOUR_CLIENT_ID"; // Se rellena tras registro en Azure
+const SCOPES = ["Sites.ReadWrite.All", "User.Read"];
+
+const SP_LISTS = {
+  clientes: "Clientes",
+  inmuebles: "Inmuebles",
+  llamadas: "Llamadas",
+  visitas: "Visita",
+  agentes: "Agentes",
+};
+
+// ── MSAL LITE (sin librería externa) ─────────────────────────────────────────
+function buildAuthUrl() {
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    response_type: "token",
+    redirect_uri: window.location.origin + window.location.pathname,
+    scope: SCOPES.join(" "),
+    response_mode: "fragment",
+  });
+  return `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?${params}`;
+}
+
+function parseTokenFromHash() {
+  const hash = window.location.hash.substring(1);
+  const params = new URLSearchParams(hash);
+  const token = params.get("access_token");
+  const expires = params.get("expires_in");
+  if (token) {
+    const expiry = Date.now() + Number(expires) * 1000;
+    sessionStorage.setItem("sp_token", token);
+    sessionStorage.setItem("sp_token_expiry", String(expiry));
+    window.history.replaceState(null, "", window.location.pathname);
+    return token;
+  }
+  return null;
+}
+
+function getToken() {
+  const token = sessionStorage.getItem("sp_token");
+  const expiry = Number(sessionStorage.getItem("sp_token_expiry") || 0);
+  if (token && Date.now() < expiry - 60000) return token;
+  return null;
+}
+
+// ── GRAPH API HELPERS ─────────────────────────────────────────────────────────
+async function getSiteId(token) {
+  const url = `${GRAPH_BASE}/sites/clavijocapital.sharepoint.com:/sites/GESTIONPROYECTOS`;
+  const res = await fetch(url, { headers: { Authorization: "Bearer " + token } });
+  const data = await res.json();
+  return data.id;
+}
+
+async function getListId(token, siteId, listName) {
+  const res = await fetch(`${GRAPH_BASE}/sites/${siteId}/lists?$filter=displayName eq '${listName}'`, {
+    headers: { Authorization: "Bearer " + token },
+  });
+  const data = await res.json();
+  return data.value?.[0]?.id;
+}
+
+async function getListItems(token, siteId, listId) {
+  const res = await fetch(`${GRAPH_BASE}/sites/${siteId}/lists/${listId}/items?$expand=fields&$top=999`, {
+    headers: { Authorization: "Bearer " + token },
+  });
+  const data = await res.json();
+  return data.value || [];
+}
+
+async function createListItem(token, siteId, listId, fields) {
+  const res = await fetch(`${GRAPH_BASE}/sites/${siteId}/lists/${listId}/items`, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify({ fields }),
+  });
+  return await res.json();
+}
+
+async function updateListItem(token, siteId, listId, itemId, fields) {
+  await fetch(`${GRAPH_BASE}/sites/${siteId}/lists/${listId}/items/${itemId}/fields`, {
+    method: "PATCH",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+    body: JSON.stringify(fields),
+  });
+}
+
+async function deleteListItem(token, siteId, listId, itemId) {
+  await fetch(`${GRAPH_BASE}/sites/${siteId}/lists/${listId}/items/${itemId}`, {
+    method: "DELETE",
+    headers: { Authorization: "Bearer " + token },
+  });
+}
+
+const INITIAL = {
+  clientes: [
+    { id: 1, nombre: "María García", telefono: "612 345 678", email: "maria@email.com", tipo: "Comprador", presupuesto_desde: 200000, presupuesto_hasta: 280000, estado: "Activo", provincia: "Madrid", zona_busca: "Zona norte", vivienda: "Piso", motivacion: "Primera Vivienda", urgencia: "3 a 6 meses", accion: "Agendar Visita", clasificacion: "Alta Prioridad", notas: "Busca 3 hab en zona norte", fecha: "2024-03-01" },
+    { id: 2, nombre: "Carlos Ruiz", telefono: "634 567 890", email: "carlos@email.com", tipo: "Vendedor", presupuesto_desde: 0, presupuesto_hasta: 0, estado: "Activo", provincia: "Barcelona", zona_busca: "", vivienda: "", motivacion: "", urgencia: "", accion: "Llamar", clasificacion: "Potencial", notas: "Quiere vender piso heredado", fecha: "2024-03-05" },
+    { id: 3, nombre: "Ana Martínez", telefono: "678 901 234", email: "ana@email.com", tipo: "Inversor", presupuesto_desde: 300000, presupuesto_hasta: 450000, estado: "Prospecto", provincia: "Valencia", zona_busca: "Centro histórico", vivienda: "Piso", motivacion: "Inversión", urgencia: "6-12 meses", accion: "Definir estado", clasificacion: "Alta Prioridad", notas: "Interesada en pisos para reformar", fecha: "2024-03-10" },
+  ],
+  inmuebles: [
+    { id: 1, direccion: "Calle Mayor 12, 3ºA", zona: "Centro", habitaciones: 3, metros: 85, precio_compra: 180000, presupuesto_reforma_inicial: 30000, coste_reforma: 35000, precio_venta: 265000, estado: "En reforma", agente_id: 1, fecha_compra: "2024-01-15", fecha_objetivo: "2024-06-15", fecha_venta: null, grado_avance: 45 },
+    { id: 2, direccion: "Avda. Constitución 45, 1ºB", zona: "Norte", habitaciones: 2, metros: 65, precio_compra: 120000, presupuesto_reforma_inicial: 25000, coste_reforma: 28000, precio_venta: 195000, estado: "En venta", agente_id: 2, fecha_compra: "2024-02-20", fecha_objetivo: "2024-07-20", fecha_venta: null, grado_avance: 80 },
+    { id: 3, direccion: "Plaza España 8, 5ºC", zona: "Centro", habitaciones: 4, metros: 110, precio_compra: 220000, presupuesto_reforma_inicial: 40000, coste_reforma: 42000, precio_venta: 320000, estado: "Vendido", agente_id: 1, fecha_compra: "2023-10-01", fecha_objetivo: "2024-03-01", fecha_venta: "2024-03-01", grado_avance: 100 },
+  ],
+  agentes: [
+    { id: 1, nombre: "Luis Fernández", telefono: "600 111 222", email: "luis@empresa.com", activo: true, comision: 2.5 },
+    { id: 2, nombre: "Sofia Pérez", telefono: "600 333 444", email: "sofia@empresa.com", activo: true, comision: 2.5 },
+  ],
+  llamadas: [
+    { id: 1, cliente_id: 1, agente_id: 1, telefono: "612 345 678", fecha: "2024-03-12", hora: "10:00", tipo: "Seguimiento", origen: "Realizada", resultado: "Interesado", motivo_perdida: "", proxima_accion: "Enviar ficha del piso", canal: "Instagram", notas: "Le mostramos el piso de Avda. Constitución", inmueble_id: 2 },
+    { id: 2, cliente_id: 3, agente_id: 2, telefono: "678 901 234", fecha: "2024-03-14", hora: "16:30", tipo: "Primera contacto", origen: "Recibida", resultado: "Pendiente", motivo_perdida: "", proxima_accion: "", canal: "Página Web", notas: "Pendiente de visitar opciones", inmueble_id: null },
+  ],
+  visitas: [
+    { id: 1, cliente_id: 1, inmueble_id: 2, agente_id: 1, fecha: "2024-03-13", hora: "11:00", resultado: "Positiva", notas: "Le gustó mucho, pide tiempo para decidir" },
+    { id: 2, cliente_id: 3, inmueble_id: 1, agente_id: 2, fecha: "2024-03-15", hora: "17:00", resultado: "Pendiente", notas: "" },
+  ],
+};
+
+function reducer(state, action) {
+  const { type, payload } = action;
+  switch (type) {
+    case "ADD": return { ...state, [payload.table]: [...state[payload.table], { ...payload.item, id: Date.now() }] };
+    case "UPDATE": return { ...state, [payload.table]: state[payload.table].map(r => r.id === payload.item.id ? payload.item : r) };
+    case "DELETE": return { ...state, [payload.table]: state[payload.table].filter(r => r.id !== payload.id) };
+    default: return state;
+  }
+}
+
+const fmt = (n) => new Intl.NumberFormat("es-ES", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(n);
+
+function Badge({ text, color }) {
+  const colors = {
+    green: { bg: "#D6F0E0", text: "#1A7A3C" },
+    blue: { bg: "#D6E6FF", text: "#1A4A9A" },
+    orange: { bg: "#FFE8CC", text: "#8A4A00" },
+    red: { bg: "#FFD6D6", text: "#8A1A1A" },
+    gray: { bg: "#E8E4DC", text: "#5A6478" },
+    gold: { bg: "#FFF0D6", text: "#7A5200" },
+  };
+  const c = colors[color] || colors.gray;
+  return <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600, background: c.bg, color: c.text, whiteSpace: "nowrap" }}>{text}</span>;
+}
+
+function estadoBadge(estado) {
+  const map = { "Activo": "green", "Prospecto": "blue", "Inactivo": "gray", "Descartado": "red", "En reforma": "orange", "En venta": "blue", "Vendido": "green", "Reservado": "gold", "Arras Firmadas": "gold", "En negociación": "gold", "En riesgo": "red", "Comprado": "orange", "Positiva": "green", "Negativa": "red", "Pendiente": "orange", "Interesado": "green", "Seguimiento": "blue", "Primera contacto": "gray", "Cierre": "gold", "Solicitud Información": "blue", "No responde en devolución": "gray", "No encaja por presupuesto": "red", "No encaja por zona": "red", "Solo curioseando": "gray", "Escalar a Gerencia": "gold", "Perdido": "red" };
+  return <Badge text={estado} color={map[estado] || "gray"} />;
+}
+
+function StatCard({ label, value, sub, accent }) {
+  return (
+    <div style={{ background: accent ? "#0F2340" : "#FAFAF7", borderRadius: 12, padding: "20px 24px", border: accent ? "none" : "1.5px solid #E8E4DC" }}>
+      <div style={{ fontSize: 12, fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.06em", color: accent ? "#C9974A" : "#7A8499", marginBottom: 8 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 800, color: accent ? "#fff" : "#0F2340", lineHeight: 1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 13, color: accent ? "#9BACC4" : "#7A8499", marginTop: 6 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Modal({ title, onClose, children }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(15,35,64,0.55)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div style={{ background: "#FAFAF7", borderRadius: 12, width: "100%", maxWidth: 560, maxHeight: "90vh", overflow: "auto", boxShadow: "0 24px 64px rgba(15,35,64,0.25)" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "20px 24px 16px", borderBottom: "1px solid #E8E4DC" }}>
+          <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: "#0F2340" }}>{title}</h2>
+          <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#7A8499", fontSize: 20, lineHeight: 1 }}>✕</button>
+        </div>
+        <div style={{ padding: 24 }}>{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#5A6478", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</label>
+      {children}
+    </div>
+  );
+}
+
+const inp = { width: "100%", padding: "10px 12px", border: "1.5px solid #D8D4CC", borderRadius: 8, fontSize: 14, color: "#0F2340", background: "#fff", boxSizing: "border-box" };
+
+function BtnSave({ onClick }) {
+  return <button onClick={onClick} style={{ padding: "10px 20px", background: "#0F2340", color: "#fff", border: "none", borderRadius: 8, cursor: "pointer", fontWeight: 700, fontSize: 14 }}>Guardar</button>;
+}
+function BtnCancel({ onClick }) {
+  return <button onClick={onClick} style={{ padding: "10px 20px", border: "1.5px solid #D8D4CC", borderRadius: 8, background: "none", cursor: "pointer", fontWeight: 600, color: "#5A6478", fontSize: 14 }}>Cancelar</button>;
+}
+function BtnEdit({ onClick }) {
+  return <button onClick={onClick} style={{ padding: "7px 14px", background: "#0F2340", color: "#fff", border: "none", borderRadius: 7, cursor: "pointer", fontWeight: 600, fontSize: 13 }}>✏ Editar</button>;
+}
+function BtnDelete({ onClick }) {
+  return <button onClick={onClick} style={{ padding: "7px 10px", background: "none", border: "1.5px solid #FFD6D6", borderRadius: 7, cursor: "pointer", color: "#8A1A1A", fontSize: 13 }}>🗑</button>;
+}
+
+// ── DASHBOARD ────────────────────────────────────────────────────────────────
+function Dashboard({ state }) {
+  const { clientes, inmuebles, llamadas, visitas, agentes } = state;
+  const vendidos = inmuebles.filter(i => i.estado === "Vendido");
+  const beneficioTotal = vendidos.reduce((s, i) => s + (i.precio_venta - i.precio_compra - i.coste_reforma), 0);
+  const inversion = inmuebles.filter(i => i.estado !== "Vendido").reduce((s, i) => s + i.precio_compra + i.coste_reforma, 0);
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", marginBottom: 4 }}>Panel General</h1>
+      <p style={{ color: "#7A8499", fontSize: 14, marginBottom: 28 }}>Visión global de la actividad</p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 16, marginBottom: 32 }}>
+        <StatCard label="Clientes activos" value={clientes.filter(c => c.estado === "Activo").length} sub={clientes.length + " total"} accent />
+        <StatCard label="Inmuebles cartera" value={inmuebles.filter(i => i.estado !== "Vendido").length} sub={fmt(inversion) + " invertido"} />
+        <StatCard label="Pisos vendidos" value={vendidos.length} sub="este año" />
+        <StatCard label="Beneficio obtenido" value={fmt(beneficioTotal)} sub={vendidos.length + " operaciones"} />
+        <StatCard label="Visitas totales" value={visitas.length} sub={llamadas.length + " llamadas"} />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+        <div style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, padding: 24 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, color: "#0F2340", margin: "0 0 16px" }}>Inmuebles por estado</h3>
+          {["En reforma", "En venta", "Reservado", "Vendido"].map(est => {
+            const cnt = inmuebles.filter(i => i.estado === est).length;
+            const pct = inmuebles.length ? (cnt / inmuebles.length * 100) : 0;
+            return (
+              <div key={est} style={{ marginBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span style={{ fontSize: 13, color: "#3A4455" }}>{est}</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: "#0F2340" }}>{cnt}</span>
+                </div>
+                <div style={{ height: 6, background: "#E8E4DC", borderRadius: 3 }}>
+                  <div style={{ height: 6, borderRadius: 3, width: pct + "%", background: est === "Vendido" ? "#1A7A3C" : est === "Disponible" ? "#1A4A9A" : est === "En reforma" ? "#C9974A" : "#5A6478" }} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, padding: 24 }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, color: "#0F2340", margin: "0 0 16px" }}>Últimas visitas</h3>
+          {[...visitas].reverse().slice(0, 5).map(v => {
+            const cliente = clientes.find(c => c.id === v.cliente_id);
+            const inmueble = inmuebles.find(i => i.id === v.inmueble_id);
+            return (
+              <div key={v.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid #F0EDE6" }}>
+                <div style={{ width: 8, height: 8, borderRadius: "50%", background: v.resultado === "Positiva" ? "#1A7A3C" : v.resultado === "Negativa" ? "#8A1A1A" : "#C9974A", flexShrink: 0 }} />
+                <div style={{ flex: 1, fontSize: 13 }}>
+                  <span style={{ fontWeight: 600, color: "#0F2340" }}>{cliente?.nombre}</span>
+                  <span style={{ color: "#7A8499" }}> · {inmueble?.direccion}</span>
+                </div>
+                {estadoBadge(v.resultado)}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── CLIENTES ─────────────────────────────────────────────────────────────────
+function Clientes({ state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+  const [search, setSearch] = useState("");
+
+  const emptyForm = { nombre: "", telefono: "", email: "", tipo: "Comprador", presupuesto_desde: "", presupuesto_hasta: "", estado: "Activo", provincia: "", zona_busca: "", vivienda: "", motivacion: "", urgencia: "", accion: "", clasificacion: "", canal: "", notas: "" };
+
+  function handleNew() { setForm({ ...emptyForm }); setEditing(false); setOpen(true); }
+  function handleEdit(c) { setForm({ ...c }); setEditing(true); setOpen(true); }
+  function handleClose() { setOpen(false); }
+  function handleSave() {
+    dispatch({ type: editing ? "UPDATE" : "ADD", payload: { table: "clientes", item: { ...form, presupuesto_desde: Number(form.presupuesto_desde) || 0, presupuesto_hasta: Number(form.presupuesto_hasta) || 0 } } });
+    setOpen(false);
+  }
+
+  const filtered = state.clientes.filter(c =>
+    c.nombre.toLowerCase().includes(search.toLowerCase()) ||
+    c.email.toLowerCase().includes(search.toLowerCase())
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", margin: 0 }}>Clientes</h1>
+          <p style={{ color: "#7A8499", fontSize: 14, margin: "4px 0 0" }}>{state.clientes.length} registros</p>
+        </div>
+        <button onClick={handleNew} style={{ background: "#C9974A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>+ Nuevo cliente</button>
+      </div>
+
+      <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar por nombre o email…" style={{ ...inp, marginBottom: 20, maxWidth: 360 }} />
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {filtered.map(c => (
+          <div key={c.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 10, padding: "16px 20px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <div style={{ flex: 2, minWidth: 150 }}>
+              <div style={{ fontWeight: 700, color: "#0F2340", fontSize: 15 }}>{c.nombre}</div>
+              <div style={{ fontSize: 13, color: "#7A8499" }}>{c.email}</div>
+            </div>
+            <div style={{ flex: 1, minWidth: 110 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Teléfono</div>
+              <div style={{ fontSize: 13, color: "#3A4455" }}>{c.telefono}</div>
+            </div>
+            <div style={{ minWidth: 90 }}>
+              <Badge text={c.tipo} color={c.tipo === "Comprador" ? "blue" : c.tipo === "Vendedor" ? "orange" : "gold"} />
+            </div>
+            <div style={{ flex: 1, minWidth: 130 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Presupuesto</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{c.presupuesto_desde || c.presupuesto_hasta ? fmt(c.presupuesto_desde || 0) + " – " + fmt(c.presupuesto_hasta || 0) : "—"}</div>
+            </div>
+            {c.provincia && <div style={{ flex: 1, minWidth: 100 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Provincia</div>
+              <div style={{ fontSize: 13, color: "#3A4455" }}>{c.provincia}</div>
+            </div>}
+            {c.vivienda && <div style={{ minWidth: 90 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Busca</div>
+              <div style={{ fontSize: 13, color: "#3A4455" }}>{c.vivienda}</div>
+            </div>}
+            <div style={{ minWidth: 80 }}>{estadoBadge(c.estado)}</div>
+            {c.accion && <div style={{ minWidth: 120 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Acción</div>
+              <Badge text={c.accion} color={c.accion === "Cliente atendido" ? "green" : c.accion === "Visita concertada" ? "blue" : c.accion === "Llamar" ? "orange" : c.accion === "Definir estado" ? "gray" : "gold"} />
+            </div>}
+            {c.clasificacion && <div style={{ minWidth: 110 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Clasificación</div>
+              <Badge text={c.clasificacion} color={c.clasificacion === "Alta Prioridad" ? "red" : c.clasificacion === "Potencial" ? "green" : c.clasificacion === "Bajo Encaje" ? "orange" : "gray"} />
+            </div>}
+            {c.canal && <div style={{ minWidth: 110 }}>
+              <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 2 }}>Canal</div>
+              <Badge text={c.canal} color="blue" />
+            </div>}
+            <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+              <BtnEdit onClick={() => handleEdit(c)} />
+              <BtnDelete onClick={() => dispatch({ type: "DELETE", payload: { table: "clientes", id: c.id } })} />
+            </div>
+          </div>
+        ))}
+        {filtered.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "#7A8499", background: "#FAFAF7", borderRadius: 10, border: "1.5px solid #E8E4DC" }}>No se encontraron clientes</div>}
+      </div>
+
+      {open && (
+        <Modal title={editing ? "Editar cliente" : "Nuevo cliente"} onClose={handleClose}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
+            <Field label="Nombre completo"><input style={inp} value={form.nombre || ""} onChange={e => setForm({ ...form, nombre: e.target.value })} /></Field>
+            <Field label="Teléfono"><input style={inp} value={form.telefono || ""} onChange={e => setForm({ ...form, telefono: e.target.value })} /></Field>
+            <Field label="Email"><input style={inp} value={form.email || ""} onChange={e => setForm({ ...form, email: e.target.value })} /></Field>
+            <Field label="Tipo">
+              <select style={inp} value={form.tipo || "Comprador"} onChange={e => setForm({ ...form, tipo: e.target.value })}>
+                {["Comprador", "Vendedor", "Inversor"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Presupuesto desde (€)"><input style={inp} type="number" value={form.presupuesto_desde || ""} onChange={e => setForm({ ...form, presupuesto_desde: e.target.value })} /></Field>
+            <Field label="Presupuesto hasta (€)"><input style={inp} type="number" value={form.presupuesto_hasta || ""} onChange={e => setForm({ ...form, presupuesto_hasta: e.target.value })} /></Field>
+            <Field label="Estado">
+              <select style={inp} value={form.estado || "Activo"} onChange={e => setForm({ ...form, estado: e.target.value })}>
+                {["Activo", "Prospecto", "Inactivo", "Descartado"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Provincia"><input style={inp} value={form.provincia || ""} onChange={e => setForm({ ...form, provincia: e.target.value })} /></Field>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Zona en la que busca"><input style={inp} value={form.zona_busca || ""} onChange={e => setForm({ ...form, zona_busca: e.target.value })} /></Field>
+            </div>
+            <Field label="Vivienda que busca">
+              <select style={inp} value={form.vivienda || ""} onChange={e => setForm({ ...form, vivienda: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Estudio", "Apartamento", "Piso", "Adosado", "Ático", "Dúplex", "Chalet"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Motivación de compra">
+              <select style={inp} value={form.motivacion || ""} onChange={e => setForm({ ...form, motivacion: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Primera Vivienda", "Inversión", "Segunda Residencia"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Urgencia">
+              <select style={inp} value={form.urgencia || ""} onChange={e => setForm({ ...form, urgencia: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["0 a 3 meses", "3 a 6 meses", "6-12 meses", "Más de 12 meses"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Acción necesaria">
+              <select style={inp} value={form.accion || ""} onChange={e => setForm({ ...form, accion: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Agendar Visita", "Visita concertada", "Llamar", "Definir estado", "Cliente atendido", "Escalar a Gerencia", "Hacer Seguimiento", "Enviar Propuesta", "Confirmar Documentación"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Clasificación">
+              <select style={inp} value={form.clasificacion || ""} onChange={e => setForm({ ...form, clasificacion: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Alta Prioridad", "Potencial", "Bajo Encaje", "No cualificado"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Canal de contacto">
+              <select style={inp} value={form.canal || ""} onChange={e => setForm({ ...form, canal: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Instagram", "LinkedIn", "Página Web", "Publicidad Impresa", "Publicidad Digital", "Referencia"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+          </div>
+          <Field label="Notas"><textarea style={{ ...inp, minHeight: 80, resize: "vertical" }} value={form.notas || ""} onChange={e => setForm({ ...form, notas: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <BtnCancel onClick={handleClose} />
+            <BtnSave onClick={handleSave} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ── INMUEBLES ─────────────────────────────────────────────────────────────────
+function Inmuebles({ state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+
+  const emptyForm = { direccion: "", zona: "", habitaciones: "", metros: "", precio_compra: "", presupuesto_reforma_inicial: "", coste_reforma: "", precio_venta: "", estado: "En reforma", agente_id: "", fecha_compra: new Date().toISOString().split("T")[0], fecha_objetivo: "", fecha_venta: "", grado_avance: 0 };
+
+  function handleNew() { setForm({ ...emptyForm }); setEditing(false); setOpen(true); }
+  function handleEdit(i) { setForm({ ...i }); setEditing(true); setOpen(true); }
+  function handleClose() { setOpen(false); }
+  function handleSave() {
+    dispatch({ type: editing ? "UPDATE" : "ADD", payload: { table: "inmuebles", item: { ...form, habitaciones: Number(form.habitaciones), metros: Number(form.metros), precio_compra: Number(form.precio_compra), presupuesto_reforma_inicial: Number(form.presupuesto_reforma_inicial) || 0, coste_reforma: Number(form.coste_reforma), precio_venta: Number(form.precio_venta), agente_id: Number(form.agente_id) } } });
+    setOpen(false);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", margin: 0 }}>Inmuebles</h1>
+          <p style={{ color: "#7A8499", fontSize: 14, margin: "4px 0 0" }}>{state.inmuebles.length} propiedades</p>
+        </div>
+        <button onClick={handleNew} style={{ background: "#C9974A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>+ Nuevo inmueble</button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(300px, 1fr))", gap: 16 }}>
+        {state.inmuebles.map(im => {
+          const beneficio = im.precio_venta - im.precio_compra - im.coste_reforma;
+          const agente = state.agentes.find(a => a.id === im.agente_id);
+          return (
+            <div key={im.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ background: "#0F2340", padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>{im.direccion}</div>
+                {estadoBadge(im.estado)}
+              </div>
+              <div style={{ padding: "16px 18px" }}>
+                {(() => {
+                  const inversion = im.precio_compra + im.coste_reforma;
+                  const beneficioNeto = im.precio_venta - inversion;
+                  const pctObtenido = inversion > 0 && im.estado === "Vendido" ? ((beneficioNeto / inversion) * 100).toFixed(1) : null;
+                  const invEstimada = im.precio_compra + (im.presupuesto_reforma_inicial || im.coste_reforma);
+                  const beneficioEstimado = im.precio_venta - invEstimada;
+                  const pctEstimado = invEstimada > 0 ? ((beneficioEstimado / invEstimada) * 100).toFixed(1) : null;
+                  return (
+                    <>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Zona</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{im.zona}</div></div>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Superficie</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{im.metros} m² · {im.habitaciones} hab</div></div>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Precio compra</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{fmt(im.precio_compra)}</div></div>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Precio venta</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{fmt(im.precio_venta)}</div></div>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Presup. reforma inicial</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{im.presupuesto_reforma_inicial ? fmt(im.presupuesto_reforma_inicial) : "—"}</div></div>
+                        <div><div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase" }}>Coste reforma real</div><div style={{ fontSize: 13, fontWeight: 600, color: "#0F2340" }}>{fmt(im.coste_reforma)}</div></div>
+                      </div>
+                      {im.fecha_compra && im.fecha_objetivo && (() => {
+                          const start = new Date(im.fecha_compra).getTime();
+                          const end = new Date(im.fecha_objetivo).getTime();
+                          const now = new Date().getTime();
+                          const total = end - start;
+                          const elapsed = now - start;
+                          const rawPct = total > 0 ? Math.min(100, Math.max(0, (elapsed / total) * 100)) : 0;
+                          const pctDisplay = rawPct.toFixed(0);
+                          const overdue = now > end && im.estado !== "Vendido";
+                          const daysLeft = Math.ceil((end - now) / (1000 * 60 * 60 * 24));
+                          const barColor = overdue ? "#8A1A1A" : rawPct > 75 ? "#C9974A" : "#1A4A9A";
+                          return (
+                            <div style={{ marginBottom: 14 }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                                <span style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", letterSpacing: "0.05em" }}>Progreso temporal</span>
+                                <span style={{ fontSize: 12, fontWeight: 700, color: overdue ? "#8A1A1A" : "#0F2340" }}>
+                                  {overdue ? "⚠ Fecha superada" : daysLeft === 0 ? "Hoy es la fecha objetivo" : daysLeft > 0 ? daysLeft + " días restantes" : ""}
+                                </span>
+                              </div>
+                              <div style={{ height: 10, background: "#E8E4DC", borderRadius: 5, overflow: "hidden" }}>
+                                <div style={{ height: 10, borderRadius: 5, width: pctDisplay + "%", background: barColor, transition: "width 0.4s" }} />
+                              </div>
+                              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                                <span style={{ fontSize: 11, color: "#7A8499" }}>{im.fecha_compra}</span>
+                                <span style={{ fontSize: 11, fontWeight: 700, color: barColor }}>{pctDisplay}%</span>
+                                <span style={{ fontSize: 11, color: "#7A8499" }}>{im.fecha_objetivo}</span>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      {(() => {
+                          const avance = im.grado_avance || 0;
+                          const avanceColor = avance === 100 ? "#1A7A3C" : avance >= 75 ? "#1A4A9A" : avance >= 40 ? "#C9974A" : "#8A1A1A";
+                          const avanceLabel = avance === 100 ? "Completado" : avance >= 75 ? "Avanzado" : avance >= 40 ? "En curso" : "Inicial";
+                          return (
+                            <div style={{ marginBottom: 14, background: "#F2EEE8", borderRadius: 10, padding: "12px 14px" }}>
+                              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                                <span style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", letterSpacing: "0.05em" }}>Grado de avance</span>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 600, color: avanceColor, background: avanceColor + "22", padding: "2px 8px", borderRadius: 10 }}>{avanceLabel}</span>
+                                  <span style={{ fontSize: 20, fontWeight: 900, color: avanceColor }}>{avance}%</span>
+                                </div>
+                              </div>
+                              <div style={{ height: 12, background: "#E8E4DC", borderRadius: 6, overflow: "hidden" }}>
+                                <div style={{ height: 12, borderRadius: 6, width: avance + "%", background: avanceColor, transition: "width 0.4s" }} />
+                              </div>
+                              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 5 }}>
+                                {[0, 25, 50, 75, 100].map(m => (
+                                  <span key={m} style={{ fontSize: 10, color: avance >= m ? avanceColor : "#B0AAA0", fontWeight: avance >= m ? 700 : 400 }}>{m}%</span>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                        <div style={{ background: "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                          <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Benef. neto estimado</div>
+                          <div style={{ fontSize: 15, fontWeight: 800, color: beneficioEstimado > 0 ? "#1A7A3C" : "#8A1A1A" }}>{pctEstimado !== null ? pctEstimado + "%" : "—"}</div>
+                          <div style={{ fontSize: 12, color: "#7A8499" }}>{pctEstimado !== null ? fmt(beneficioEstimado) : ""}</div>
+                        </div>
+                        <div style={{ background: im.estado === "Vendido" ? (beneficioNeto > 0 ? "#D6F0E0" : "#FFD6D6") : "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                          <div style={{ fontSize: 11, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Benef. neto obtenido</div>
+                          <div style={{ fontSize: 15, fontWeight: 800, color: pctObtenido !== null ? (beneficioNeto > 0 ? "#1A7A3C" : "#8A1A1A") : "#7A8499" }}>{pctObtenido !== null ? pctObtenido + "%" : "—"}</div>
+                          <div style={{ fontSize: 12, color: "#7A8499" }}>{pctObtenido !== null ? fmt(beneficioNeto) : "Solo al vender"}</div>
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontSize: 12, color: "#7A8499" }}>{agente?.nombre || "Sin agente"}</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <BtnEdit onClick={() => handleEdit(im)} />
+                    <BtnDelete onClick={() => dispatch({ type: "DELETE", payload: { table: "inmuebles", id: im.id } })} />
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {open && (
+        <Modal title={editing ? "Editar inmueble" : "Nuevo inmueble"} onClose={handleClose}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
+            <div style={{ gridColumn: "1/-1" }}><Field label="Dirección"><input style={inp} value={form.direccion || ""} onChange={e => setForm({ ...form, direccion: e.target.value })} /></Field></div>
+            <Field label="Zona"><input style={inp} value={form.zona || ""} onChange={e => setForm({ ...form, zona: e.target.value })} /></Field>
+            <Field label="Estado">
+              <select style={inp} value={form.estado || "En reforma"} onChange={e => setForm({ ...form, estado: e.target.value })}>
+                {["En reforma", "En venta", "En negociación", "En riesgo", "Reservado", "Arras Firmadas", "Comprado", "Vendido"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Habitaciones"><input style={inp} type="number" value={form.habitaciones || ""} onChange={e => setForm({ ...form, habitaciones: e.target.value })} /></Field>
+            <Field label="Metros²"><input style={inp} type="number" value={form.metros || ""} onChange={e => setForm({ ...form, metros: e.target.value })} /></Field>
+            <Field label="Precio compra (€)"><input style={inp} type="number" value={form.precio_compra || ""} onChange={e => setForm({ ...form, precio_compra: e.target.value })} /></Field>
+            <Field label="Presupuesto reforma inicial (€)"><input style={inp} type="number" value={form.presupuesto_reforma_inicial || ""} onChange={e => setForm({ ...form, presupuesto_reforma_inicial: e.target.value })} /></Field>
+            <Field label="Coste reforma real (€)"><input style={inp} type="number" value={form.coste_reforma || ""} onChange={e => setForm({ ...form, coste_reforma: e.target.value })} /></Field>
+            <Field label="Precio venta (€)"><input style={inp} type="number" value={form.precio_venta || ""} onChange={e => setForm({ ...form, precio_venta: e.target.value })} /></Field>
+            <Field label="Agente">
+              <select style={inp} value={form.agente_id || ""} onChange={e => setForm({ ...form, agente_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.agentes.map(a => <option key={a.id} value={a.id}>{a.nombre}</option>)}
+              </select>
+            </Field>
+            <Field label="Fecha compra"><input style={inp} type="date" value={form.fecha_compra || ""} onChange={e => setForm({ ...form, fecha_compra: e.target.value })} /></Field>
+            <Field label="Fecha objetivo"><input style={inp} type="date" value={form.fecha_objetivo || ""} onChange={e => setForm({ ...form, fecha_objetivo: e.target.value })} /></Field>
+            <Field label="Fecha venta"><input style={inp} type="date" value={form.fecha_venta || ""} onChange={e => setForm({ ...form, fecha_venta: e.target.value })} /></Field>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label={"Grado de avance: " + (form.grado_avance || 0) + "%"}>
+                <input type="range" min="0" max="100" step="1" value={form.grado_avance || 0} onChange={e => setForm({ ...form, grado_avance: Number(e.target.value) })} style={{ width: "100%", accentColor: "#0F2340", height: 6, cursor: "pointer" }} />
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#7A8499", marginTop: 4 }}>
+                  <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+                </div>
+              </Field>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <BtnCancel onClick={handleClose} />
+            <BtnSave onClick={handleSave} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ── LLAMADAS ─────────────────────────────────────────────────────────────────
+function Llamadas({ state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+
+  const emptyForm = { cliente_id: "", agente_id: "", telefono: "", fecha: new Date().toISOString().split("T")[0], hora: "10:00", tipo: "Seguimiento", origen: "", resultado: "Pendiente", proxima_accion: "", canal: "", notas: "", inmueble_id: "" };
+
+  function handleNew() { setForm({ ...emptyForm }); setEditing(false); setOpen(true); }
+  function handleEdit(l) { setForm({ ...l, inmueble_id: l.inmueble_id || "" }); setEditing(true); setOpen(true); }
+  function handleClose() { setOpen(false); }
+  function handleSave() {
+    dispatch({ type: editing ? "UPDATE" : "ADD", payload: { table: "llamadas", item: { ...form, cliente_id: Number(form.cliente_id), agente_id: Number(form.agente_id), inmueble_id: form.inmueble_id ? Number(form.inmueble_id) : null } } });
+    setOpen(false);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", margin: 0 }}>Llamadas</h1>
+          <p style={{ color: "#7A8499", fontSize: 14, margin: "4px 0 0" }}>{state.llamadas.length} registradas</p>
+        </div>
+        <button onClick={handleNew} style={{ background: "#C9974A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>+ Registrar llamada</button>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {[...state.llamadas].reverse().map(l => {
+          const cliente = state.clientes.find(c => c.id === l.cliente_id);
+          const agente = state.agentes.find(a => a.id === l.agente_id);
+          const inmueble = state.inmuebles.find(i => i.id === l.inmueble_id);
+          return (
+            <div key={l.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 10, padding: "16px 20px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+              <div style={{ flex: 2, minWidth: 150 }}>
+                <div style={{ fontWeight: 700, color: "#0F2340", fontSize: 14 }}>{cliente?.nombre || "—"}</div>
+                <div style={{ fontSize: 12, color: "#7A8499" }}>{l.fecha} {l.hora} · {agente?.nombre}{l.telefono ? " · " + l.telefono : ""}</div>
+              </div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                {estadoBadge(l.tipo)}
+                {estadoBadge(l.resultado)}
+                {l.origen && <Badge text={l.origen} color={l.origen === "Recibida" ? "blue" : "orange"} />}
+                {l.canal && <Badge text={l.canal} color="gray" />}
+              </div>
+              {inmueble && <div style={{ fontSize: 13, color: "#5A6478", flex: 1, minWidth: 120 }}>{inmueble.direccion}</div>}
+              {l.proxima_accion && <div style={{ fontSize: 13, color: "#0F2340", minWidth: 120 }}>→ {l.proxima_accion}</div>}
+              {l.resultado === "Perdido" && l.motivo_perdida && <div style={{ fontSize: 13, color: "#8A1A1A", minWidth: 120, fontWeight: 600 }}>⚠ {l.motivo_perdida}</div>}
+              {l.notas && <div style={{ fontSize: 13, color: "#5A6478", flex: 2, minWidth: 120, fontStyle: "italic" }}>{l.notas}</div>}
+              <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+                <BtnEdit onClick={() => handleEdit(l)} />
+                <BtnDelete onClick={() => dispatch({ type: "DELETE", payload: { table: "llamadas", id: l.id } })} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {open && (
+        <Modal title={editing ? "Editar llamada" : "Registrar llamada"} onClose={handleClose}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
+            <Field label="Cliente">
+              <select style={inp} value={form.cliente_id || ""} onChange={e => setForm({ ...form, cliente_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.clientes.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+              </select>
+            </Field>
+            <Field label="Agente">
+              <select style={inp} value={form.agente_id || ""} onChange={e => setForm({ ...form, agente_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.agentes.map(a => <option key={a.id} value={a.id}>{a.nombre}</option>)}
+              </select>
+            </Field>
+            <Field label="Teléfono"><input style={inp} value={form.telefono || ""} onChange={e => setForm({ ...form, telefono: e.target.value })} /></Field>
+            <Field label="Origen">
+              <select style={inp} value={form.origen || ""} onChange={e => setForm({ ...form, origen: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Recibida", "Realizada"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Fecha"><input style={inp} type="date" value={form.fecha || ""} onChange={e => setForm({ ...form, fecha: e.target.value })} /></Field>
+            <Field label="Hora"><input style={inp} type="time" value={form.hora || ""} onChange={e => setForm({ ...form, hora: e.target.value })} /></Field>
+            <Field label="Tipo">
+              <select style={inp} value={form.tipo || "Seguimiento"} onChange={e => setForm({ ...form, tipo: e.target.value })}>
+                {["Primera contacto", "Seguimiento", "Cierre"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Resultado">
+              <select style={inp} value={form.resultado || "Pendiente"} onChange={e => setForm({ ...form, resultado: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Interesado", "Pendiente", "Solicitud Información", "No responde en devolución", "No encaja por presupuesto", "No encaja por zona", "Solo curioseando", "Escalar a Gerencia", "Perdido"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            {form.resultado === "Perdido" && (
+              <div style={{ gridColumn: "1/-1" }}>
+                <Field label="Motivo de pérdida"><textarea style={{ ...inp, minHeight: 70, resize: "vertical" }} value={form.motivo_perdida || ""} onChange={e => setForm({ ...form, motivo_perdida: e.target.value })} placeholder="Indica el motivo por el que se ha perdido este cliente…" /></Field>
+              </div>
+            )}
+            <Field label="Canal de contacto">
+              <select style={inp} value={form.canal || ""} onChange={e => setForm({ ...form, canal: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {["Instagram", "LinkedIn", "Página Web", "Publicidad Impresa", "Publicidad Digital", "Referencia"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Próxima acción"><input style={inp} value={form.proxima_accion || ""} onChange={e => setForm({ ...form, proxima_accion: e.target.value })} /></Field>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Inmueble relacionado (opcional)">
+                <select style={inp} value={form.inmueble_id || ""} onChange={e => setForm({ ...form, inmueble_id: e.target.value })}>
+                  <option value="">— Ninguno —</option>
+                  {state.inmuebles.map(i => <option key={i.id} value={i.id}>{i.direccion}</option>)}
+                </select>
+              </Field>
+            </div>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Notas"><textarea style={{ ...inp, minHeight: 80, resize: "vertical" }} value={form.notas || ""} onChange={e => setForm({ ...form, notas: e.target.value })} /></Field>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <BtnCancel onClick={handleClose} />
+            <BtnSave onClick={handleSave} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ── VISITAS ───────────────────────────────────────────────────────────────────
+function Visitas({ state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+
+  const emptyForm = { cliente_id: "", inmueble_id: "", agente_id: "", fecha: new Date().toISOString().split("T")[0], hora: "10:00", resultado: "Pendiente", notas: "" };
+
+  function handleNew() { setForm({ ...emptyForm }); setEditing(false); setOpen(true); }
+  function handleEdit(v) { setForm({ ...v }); setEditing(true); setOpen(true); }
+  function handleClose() { setOpen(false); }
+  function handleSave() {
+    dispatch({ type: editing ? "UPDATE" : "ADD", payload: { table: "visitas", item: { ...form, cliente_id: Number(form.cliente_id), inmueble_id: Number(form.inmueble_id), agente_id: Number(form.agente_id) } } });
+    setOpen(false);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", margin: 0 }}>Visitas</h1>
+          <p style={{ color: "#7A8499", fontSize: 14, margin: "4px 0 0" }}>{state.visitas.length} registradas</p>
+        </div>
+        <button onClick={handleNew} style={{ background: "#C9974A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>+ Registrar visita</button>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {[...state.visitas].reverse().map(v => {
+          const cliente = state.clientes.find(c => c.id === v.cliente_id);
+          const inmueble = state.inmuebles.find(i => i.id === v.inmueble_id);
+          const agente = state.agentes.find(a => a.id === v.agente_id);
+          return (
+            <div key={v.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 10, padding: "16px 20px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+              <div style={{ flex: 2, minWidth: 150 }}>
+                <div style={{ fontWeight: 700, color: "#0F2340", fontSize: 14 }}>{cliente?.nombre || "—"}</div>
+                <div style={{ fontSize: 12, color: "#7A8499" }}>{v.fecha} {v.hora} · {agente?.nombre}</div>
+              </div>
+              <div style={{ flex: 2, minWidth: 150, fontSize: 13, color: "#3A4455" }}>{inmueble?.direccion || "—"}</div>
+              {estadoBadge(v.resultado)}
+              {v.notas && <div style={{ fontSize: 13, color: "#5A6478", flex: 2, minWidth: 120, fontStyle: "italic" }}>{v.notas}</div>}
+              <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+                <BtnEdit onClick={() => handleEdit(v)} />
+                <BtnDelete onClick={() => dispatch({ type: "DELETE", payload: { table: "visitas", id: v.id } })} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {open && (
+        <Modal title={editing ? "Editar visita" : "Registrar visita"} onClose={handleClose}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
+            <Field label="Cliente">
+              <select style={inp} value={form.cliente_id || ""} onChange={e => setForm({ ...form, cliente_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.clientes.map(c => <option key={c.id} value={c.id}>{c.nombre}</option>)}
+              </select>
+            </Field>
+            <Field label="Inmueble">
+              <select style={inp} value={form.inmueble_id || ""} onChange={e => setForm({ ...form, inmueble_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.inmuebles.map(i => <option key={i.id} value={i.id}>{i.direccion}</option>)}
+              </select>
+            </Field>
+            <Field label="Agente">
+              <select style={inp} value={form.agente_id || ""} onChange={e => setForm({ ...form, agente_id: e.target.value })}>
+                <option value="">— Seleccionar —</option>
+                {state.agentes.map(a => <option key={a.id} value={a.id}>{a.nombre}</option>)}
+              </select>
+            </Field>
+            <Field label="Resultado">
+              <select style={inp} value={form.resultado || "Pendiente"} onChange={e => setForm({ ...form, resultado: e.target.value })}>
+                {["Pendiente", "Positiva", "Negativa"].map(t => <option key={t}>{t}</option>)}
+              </select>
+            </Field>
+            <Field label="Fecha"><input style={inp} type="date" value={form.fecha || ""} onChange={e => setForm({ ...form, fecha: e.target.value })} /></Field>
+            <Field label="Hora"><input style={inp} type="time" value={form.hora || ""} onChange={e => setForm({ ...form, hora: e.target.value })} /></Field>
+            <div style={{ gridColumn: "1/-1" }}>
+              <Field label="Notas"><textarea style={{ ...inp, minHeight: 80, resize: "vertical" }} value={form.notas || ""} onChange={e => setForm({ ...form, notas: e.target.value })} /></Field>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <BtnCancel onClick={handleClose} />
+            <BtnSave onClick={handleSave} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ── AGENTES ───────────────────────────────────────────────────────────────────
+function Agentes({ state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({});
+
+  const emptyForm = { nombre: "", telefono: "", email: "", comision: 2.5, activo: true };
+
+  function handleNew() { setForm({ ...emptyForm }); setEditing(false); setOpen(true); }
+  function handleEdit(a) { setForm({ ...a }); setEditing(true); setOpen(true); }
+  function handleClose() { setOpen(false); }
+  function handleSave() {
+    dispatch({ type: editing ? "UPDATE" : "ADD", payload: { table: "agentes", item: { ...form, comision: Number(form.comision) } } });
+    setOpen(false);
+  }
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+        <div>
+          <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", margin: 0 }}>Agentes</h1>
+          <p style={{ color: "#7A8499", fontSize: 14, margin: "4px 0 0" }}>{state.agentes.length} agentes</p>
+        </div>
+        <button onClick={handleNew} style={{ background: "#C9974A", color: "#fff", border: "none", borderRadius: 8, padding: "10px 18px", fontWeight: 700, cursor: "pointer", fontSize: 14 }}>+ Nuevo agente</button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 16 }}>
+        {state.agentes.map(a => {
+          const ventas = state.inmuebles.filter(i => i.agente_id === a.id && i.estado === "Vendido").length;
+          const visitasA = state.visitas.filter(v => v.agente_id === a.id).length;
+          const llamadasA = state.llamadas.filter(l => l.agente_id === a.id).length;
+          return (
+            <div key={a.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ background: "#0F2340", padding: "20px", display: "flex", alignItems: "center", gap: 14 }}>
+                <div style={{ width: 48, height: 48, borderRadius: "50%", background: "#C9974A", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 16, color: "#0F2340", flexShrink: 0 }}>
+                  {a.nombre.split(" ").map(n => n[0]).join("").slice(0, 2)}
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 15, fontWeight: 800, color: "#fff" }}>{a.nombre}</div>
+                  <div style={{ fontSize: 12, color: "#9BACC4" }}>{a.email}</div>
+                </div>
+                <Badge text={a.activo ? "Activo" : "Inactivo"} color={a.activo ? "green" : "gray"} />
+              </div>
+              <div style={{ padding: 18 }}>
+                <div style={{ fontSize: 13, color: "#5A6478", marginBottom: 14 }}>{a.telefono} · {a.email}</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 14 }}>
+                  {[["Ventas", ventas], ["Visitas", visitasA], ["Llamadas", llamadasA]].map(([l, v]) => (
+                    <div key={l} style={{ textAlign: "center", background: "#F2EEE8", borderRadius: 8, padding: "10px 4px" }}>
+                      <div style={{ fontSize: 20, fontWeight: 800, color: "#0F2340" }}>{v}</div>
+                      <div style={{ fontSize: 11, color: "#7A8499" }}>{l}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <BtnEdit onClick={() => handleEdit(a)} />
+                  <BtnDelete onClick={() => dispatch({ type: "DELETE", payload: { table: "agentes", id: a.id } })} />
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {open && (
+        <Modal title={editing ? "Editar agente" : "Nuevo agente"} onClose={handleClose}>
+          <Field label="Nombre completo"><input style={inp} value={form.nombre || ""} onChange={e => setForm({ ...form, nombre: e.target.value })} /></Field>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 16px" }}>
+            <Field label="Teléfono"><input style={inp} value={form.telefono || ""} onChange={e => setForm({ ...form, telefono: e.target.value })} /></Field>
+            <Field label="Email"><input style={inp} value={form.email || ""} onChange={e => setForm({ ...form, email: e.target.value })} /></Field>
+            <Field label="Estado">
+              <select style={inp} value={String(form.activo)} onChange={e => setForm({ ...form, activo: e.target.value === "true" })}>
+                <option value="true">Activo</option>
+                <option value="false">Inactivo</option>
+              </select>
+            </Field>
+          </div>
+          <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 8 }}>
+            <BtnCancel onClick={handleClose} />
+            <BtnSave onClick={handleSave} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ── REPORTES ──────────────────────────────────────────────────────────────────
+function Reportes({ state }) {
+  const { clientes, inmuebles, llamadas, visitas, agentes } = state;
+  const vendidos = inmuebles.filter(i => i.estado === "Vendido");
+  const activos = inmuebles.filter(i => i.estado !== "Vendido");
+  const beneficioTotal = vendidos.reduce((s, i) => s + (i.precio_venta - i.precio_compra - i.coste_reforma), 0);
+  const inversionActual = activos.reduce((s, i) => s + i.precio_compra + i.coste_reforma, 0);
+  const ROI = vendidos.length ? (beneficioTotal / vendidos.reduce((s, i) => s + i.precio_compra + i.coste_reforma, 0) * 100).toFixed(1) : 0;
+
+  return (
+    <div>
+      <h1 style={{ fontSize: 26, fontWeight: 800, color: "#0F2340", marginBottom: 4 }}>Reportes</h1>
+      <p style={{ color: "#7A8499", fontSize: 14, marginBottom: 28 }}>Análisis financiero y operativo</p>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14, marginBottom: 32 }}>
+        <StatCard label="Beneficio realizado" value={fmt(beneficioTotal)} sub={ROI + "% ROI medio"} accent />
+        <StatCard label="Inversión activa" value={fmt(inversionActual)} sub={activos.length + " inmuebles"} />
+        <StatCard label="Ticket medio venta" value={vendidos.length ? fmt(vendidos.reduce((s, i) => s + i.precio_venta, 0) / vendidos.length) : "—"} sub={vendidos.length + " ventas"} />
+        <StatCard label="Clientes totales" value={clientes.length} sub={clientes.filter(c => c.estado === "Activo").length + " activos"} />
+      </div>
+
+      <h2 style={{ fontSize: 14, fontWeight: 700, color: "#0F2340", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.06em" }}>Detalle por operación cerrada</h2>
+      {vendidos.length === 0 ? (
+        <div style={{ background: "#F2EEE8", borderRadius: 10, padding: 28, textAlign: "center", color: "#7A8499", fontSize: 14, marginBottom: 28 }}>No hay operaciones cerradas todavía</div>
+      ) : (
+        <div style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, overflow: "auto", marginBottom: 32 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
+            <thead>
+              <tr style={{ background: "#F2EEE8" }}>
+                {["Inmueble", "Compra", "Reforma", "Venta", "Beneficio", "ROI", "Agente"].map(h => (
+                  <th key={h} style={{ textAlign: "left", padding: "12px 16px", fontSize: 11, fontWeight: 700, color: "#7A8499", textTransform: "uppercase" }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {vendidos.map((im, i) => {
+                const ben = im.precio_venta - im.precio_compra - im.coste_reforma;
+                const roi = ((ben / (im.precio_compra + im.coste_reforma)) * 100).toFixed(1);
+                const agente = agentes.find(a => a.id === im.agente_id);
+                return (
+                  <tr key={im.id} style={{ borderTop: "1px solid #F0EDE6", background: i % 2 === 0 ? "#FAFAF7" : "#fff" }}>
+                    <td style={{ padding: "12px 16px", fontWeight: 600, color: "#0F2340", fontSize: 13 }}>{im.direccion}</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13 }}>{fmt(im.precio_compra)}</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13 }}>{fmt(im.coste_reforma)}</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13, fontWeight: 600 }}>{fmt(im.precio_venta)}</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13, fontWeight: 700, color: ben > 0 ? "#1A7A3C" : "#8A1A1A" }}>{fmt(ben)}</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13, fontWeight: 700, color: "#C9974A" }}>{roi}%</td>
+                    <td style={{ padding: "12px 16px", fontSize: 13 }}>{agente?.nombre || "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <h2 style={{ fontSize: 14, fontWeight: 700, color: "#0F2340", marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.06em" }}>Resumen de inmuebles en cartera</h2>
+      <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+        {inmuebles.map(im => {
+          const avance = im.grado_avance || 0;
+          const avanceColor = avance === 100 ? "#1A7A3C" : avance >= 75 ? "#1A4A9A" : avance >= 40 ? "#C9974A" : "#8A1A1A";
+          const avanceLabel = avance === 100 ? "Completado" : avance >= 75 ? "Avanzado" : avance >= 40 ? "En curso" : "Inicial";
+          const inversionReal = im.precio_compra + im.coste_reforma;
+          const inversionEstimada = im.precio_compra + (im.presupuesto_reforma_inicial || im.coste_reforma);
+          const desviacion = im.coste_reforma - (im.presupuesto_reforma_inicial || im.coste_reforma);
+          const beneficioEstimado = im.precio_venta - inversionEstimada;
+          const beneficioReal = im.precio_venta - inversionReal;
+          const agente = agentes.find(a => a.id === im.agente_id);
+          return (
+            <div key={im.id} style={{ background: "#FAFAF7", border: "1.5px solid #E8E4DC", borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ background: "#0F2340", padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>{im.direccion}</div>
+                  <div style={{ fontSize: 12, color: "#9BACC4", marginTop: 2 }}>{im.zona} · {agente?.nombre || "Sin agente"}</div>
+                </div>
+                <Badge text={im.estado} color={im.estado === "Vendido" ? "green" : im.estado === "En riesgo" ? "red" : im.estado === "En reforma" ? "orange" : "blue"} />
+              </div>
+              <div style={{ padding: "16px 20px" }}>
+                {/* Grado de avance */}
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: "#5A6478", textTransform: "uppercase", letterSpacing: "0.05em" }}>Grado de avance</span>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: avanceColor, background: avanceColor + "22", padding: "2px 8px", borderRadius: 10 }}>{avanceLabel}</span>
+                      <span style={{ fontSize: 18, fontWeight: 900, color: avanceColor }}>{avance}%</span>
+                    </div>
+                  </div>
+                  <div style={{ height: 10, background: "#E8E4DC", borderRadius: 5, overflow: "hidden" }}>
+                    <div style={{ height: 10, borderRadius: 5, width: avance + "%", background: avanceColor, transition: "width 0.4s" }} />
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+                    {[0, 25, 50, 75, 100].map(m => (
+                      <span key={m} style={{ fontSize: 10, color: avance >= m ? avanceColor : "#B0AAA0", fontWeight: avance >= m ? 700 : 400 }}>{m}%</span>
+                    ))}
+                  </div>
+                </div>
+                {/* Tabla de costes */}
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+                  <div style={{ background: "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Precio compra</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#0F2340" }}>{fmt(im.precio_compra)}</div>
+                  </div>
+                  <div style={{ background: "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Presup. reforma</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#0F2340" }}>{im.presupuesto_reforma_inicial ? fmt(im.presupuesto_reforma_inicial) : "—"}</div>
+                  </div>
+                  <div style={{ background: desviacion > 0 ? "#FFD6D6" : "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Coste real reforma</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: desviacion > 0 ? "#8A1A1A" : "#0F2340" }}>{fmt(im.coste_reforma)}</div>
+                    {desviacion !== 0 && <div style={{ fontSize: 10, color: desviacion > 0 ? "#8A1A1A" : "#1A7A3C", marginTop: 2 }}>{desviacion > 0 ? "⚠ +" : "✓ "}{fmt(desviacion)} vs presup.</div>}
+                  </div>
+                  <div style={{ background: "#F2EEE8", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Precio venta</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#0F2340" }}>{fmt(im.precio_venta)}</div>
+                  </div>
+                  <div style={{ background: beneficioEstimado > 0 ? "#D6E6FF" : "#FFD6D6", borderRadius: 8, padding: "10px 12px", gridColumn: "span 2" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Benef. estimado</div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: beneficioEstimado > 0 ? "#1A4A9A" : "#8A1A1A" }}>{fmt(beneficioEstimado)} <span style={{ fontSize: 12 }}>({inversionEstimada > 0 ? ((beneficioEstimado / inversionEstimada) * 100).toFixed(1) : 0}%)</span></div>
+                  </div>
+                  <div style={{ background: im.estado === "Vendido" ? (beneficioReal > 0 ? "#D6F0E0" : "#FFD6D6") : "#F2EEE8", borderRadius: 8, padding: "10px 12px", gridColumn: "span 2" }}>
+                    <div style={{ fontSize: 10, color: "#7A8499", textTransform: "uppercase", marginBottom: 4 }}>Benef. real obtenido</div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: im.estado === "Vendido" ? (beneficioReal > 0 ? "#1A7A3C" : "#8A1A1A") : "#7A8499" }}>
+                      {im.estado === "Vendido" ? fmt(beneficioReal) + " (" + ((beneficioReal / inversionReal) * 100).toFixed(1) + "%)" : "Pendiente de venta"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── APP ───────────────────────────────────────────────────────────────────────
+const NAV = [
+  { id: "dashboard", label: "Panel" },
+  { id: "clientes", label: "Clientes" },
+  { id: "inmuebles", label: "Inmuebles" },
+  { id: "llamadas", label: "Llamadas" },
+  { id: "visitas", label: "Visitas" },
+  { id: "agentes", label: "Agentes" },
+  { id: "reportes", label: "Reportes" },
+];
+
+export default function App() {
+  const [page, setPage] = useState("dashboard");
+  const [state, dispatch] = useReducer(reducer, INITIAL);
+  const PAGES = { dashboard: Dashboard, clientes: Clientes, inmuebles: Inmuebles, llamadas: Llamadas, visitas: Visitas, agentes: Agentes, reportes: Reportes };
+  const Page = PAGES[page];
+
+  // ── SharePoint auth state ──────────────────────────────────────────────────
+  const [spToken, setSpToken] = useState(() => getToken());
+  const [spStatus, setSpStatus] = useState("idle"); // idle | connecting | syncing | ok | error | no_client_id
+  const [spError, setSpError] = useState("");
+  const [siteId, setSiteId] = useState(null);
+  const [listIds, setListIds] = useState({});
+  const [spUser, setSpUser] = useState(null);
+
+  // Check for token in URL hash on load (after MS redirect)
+  useEffect(() => {
+    const token = parseTokenFromHash() || getToken();
+    if (token) setSpToken(token);
+  }, []);
+
+  // On token available, fetch site/list IDs and user info
+  useEffect(() => {
+    if (!spToken) return;
+    if (CLIENT_ID === "YOUR_CLIENT_ID") { setSpStatus("no_client_id"); return; }
+    setSpStatus("connecting");
+    (async () => {
+      try {
+        // Get user
+        const userRes = await fetch(`${GRAPH_BASE}/me`, { headers: { Authorization: "Bearer " + spToken } });
+        const userData = await userRes.json();
+        setSpUser(userData.displayName || userData.mail);
+        // Get site
+        const sid = await getSiteId(spToken);
+        setSiteId(sid);
+        // Get list IDs
+        const ids = {};
+        for (const [key, name] of Object.entries(SP_LISTS)) {
+          ids[key] = await getListId(spToken, sid, name);
+        }
+        setListIds(ids);
+        setSpStatus("ok");
+      } catch (e) {
+        setSpError("Error conectando con SharePoint: " + e.message);
+        setSpStatus("error");
+      }
+    })();
+  }, [spToken]);
+
+  // ── Sync: load from SharePoint ─────────────────────────────────────────────
+  const loadFromSP = useCallback(async () => {
+    if (!spToken || !siteId || Object.keys(listIds).length < 5) return;
+    setSpStatus("syncing");
+    try {
+      for (const [key, listId] of Object.entries(listIds)) {
+        if (!listId) continue;
+        const items = await getListItems(spToken, siteId, listId);
+        items.forEach(item => {
+          const fields = item.fields;
+          const parsed = { ...fields, id: item.id, _spId: item.id };
+          // Parse numbers
+          ["presupuesto_desde","presupuesto_hasta","presupuesto_reforma_inicial","coste_reforma","precio_compra","precio_venta","habitaciones","metros","grado_avance","comision"].forEach(f => {
+            if (fields[f] !== undefined) parsed[f] = Number(fields[f]) || 0;
+          });
+          dispatch({ type: "ADD", payload: { table: key, item: parsed } });
+        });
+      }
+      setSpStatus("ok");
+    } catch (e) {
+      setSpError("Error cargando datos: " + e.message);
+      setSpStatus("error");
+    }
+  }, [spToken, siteId, listIds]);
+
+  // ── Sync: save item to SharePoint ─────────────────────────────────────────
+  const saveToSP = useCallback(async (table, item, operation) => {
+    if (!spToken || !siteId || !listIds[table]) return;
+    const { id, _spId, ...fields } = item;
+    try {
+      if (operation === "ADD") {
+        const created = await createListItem(spToken, siteId, listIds[table], fields);
+        dispatch({ type: "UPDATE", payload: { table, item: { ...item, _spId: created.id } } });
+      } else if (operation === "UPDATE" && _spId) {
+        await updateListItem(spToken, siteId, listIds[table], _spId, fields);
+      } else if (operation === "DELETE" && _spId) {
+        await deleteListItem(spToken, siteId, listIds[table], _spId);
+      }
+    } catch (e) {
+      setSpError("Error guardando en SharePoint: " + e.message);
+    }
+  }, [spToken, siteId, listIds]);
+
+  // Wrap dispatch to also sync to SP
+  const dispatchWithSync = useCallback((action) => {
+    dispatch(action);
+    if (spStatus === "ok" && action.type !== "ADD" || action.payload?.item?._spId) {
+      // Only sync if connected
+    }
+  }, [spStatus]);
+
+  // Status pill color
+  const statusColor = { idle: "#7A8499", connecting: "#C9974A", syncing: "#1A4A9A", ok: "#1A7A3C", error: "#8A1A1A", no_client_id: "#8A4A00" };
+  const statusLabel = { idle: "Sin conectar", connecting: "Conectando…", syncing: "Sincronizando…", ok: "Conectado", error: "Error", no_client_id: "Falta Client ID" };
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh", background: "#F2EEE8", fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ width: 210, background: "#0F2340", display: "flex", flexDirection: "column", flexShrink: 0, position: "sticky", top: 0, height: "100vh" }}>
+        <div style={{ padding: "24px 20px 16px" }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: "#C9974A", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>InmoGestión</div>
+          <div style={{ fontSize: 18, fontWeight: 800, color: "#fff", lineHeight: 1.2 }}>CRM Inmobiliario</div>
+        </div>
+        <div style={{ margin: "0 20px 12px", height: 1, background: "rgba(201,151,74,0.3)" }} />
+
+        {/* SharePoint status */}
+        <div style={{ margin: "0 12px 12px", background: "rgba(255,255,255,0.05)", borderRadius: 8, padding: "10px 12px" }}>
+          <div style={{ fontSize: 10, color: "#7A9BB5", textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 6 }}>SharePoint</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor[spStatus], flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: "#fff", fontWeight: 600 }}>{statusLabel[spStatus]}</span>
+          </div>
+          {spUser && <div style={{ fontSize: 11, color: "#9BACC4", marginBottom: 8, wordBreak: "break-all" }}>{spUser}</div>}
+          {spError && <div style={{ fontSize: 11, color: "#FF9999", marginBottom: 6 }}>{spError}</div>}
+          {spStatus === "no_client_id" && (
+            <div style={{ fontSize: 10, color: "#FFD699", lineHeight: 1.4 }}>Registra la app en Azure AD y añade el Client ID al código</div>
+          )}
+          {!spToken && CLIENT_ID !== "YOUR_CLIENT_ID" && (
+            <button onClick={() => window.location.href = buildAuthUrl()} style={{ width: "100%", background: "#0078D4", color: "#fff", border: "none", borderRadius: 6, padding: "7px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+              🔑 Login Microsoft
+            </button>
+          )}
+          {spToken && spStatus === "ok" && Object.keys(listIds).length > 0 && (
+            <button onClick={loadFromSP} style={{ width: "100%", background: "rgba(201,151,74,0.2)", color: "#C9974A", border: "1px solid #C9974A", borderRadius: 6, padding: "7px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+              ↻ Cargar datos SP
+            </button>
+          )}
+          {spToken && (
+            <button onClick={() => { sessionStorage.clear(); setSpToken(null); setSpStatus("idle"); setSpUser(null); setSiteId(null); setListIds({}); }} style={{ width: "100%", marginTop: 6, background: "none", color: "#7A9BB5", border: "1px solid #2A4060", borderRadius: 6, padding: "5px 10px", fontSize: 11, cursor: "pointer" }}>
+              Cerrar sesión
+            </button>
+          )}
+        </div>
+
+        <nav style={{ flex: 1, padding: "0 10px" }}>
+          {NAV.map(n => {
+            const active = page === n.id;
+            return (
+              <button key={n.id} onClick={() => setPage(n.id)} style={{ display: "block", width: "100%", padding: "11px 14px", borderRadius: 8, border: "none", background: active ? "rgba(201,151,74,0.15)" : "none", color: active ? "#C9974A" : "#7A9BB5", cursor: "pointer", fontSize: 14, fontWeight: active ? 700 : 500, marginBottom: 2, textAlign: "left", borderLeft: active ? "3px solid #C9974A" : "3px solid transparent" }}>
+                {n.label}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* Paso a paso para activar */}
+        {spStatus === "no_client_id" && (
+          <div style={{ margin: "0 12px 16px", background: "rgba(201,151,74,0.1)", border: "1px solid rgba(201,151,74,0.3)", borderRadius: 8, padding: "10px 12px" }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: "#C9974A", textTransform: "uppercase", marginBottom: 6 }}>Cómo activar</div>
+            {["1. Ve a portal.azure.com", "2. Azure AD → Registros de app", "3. Nueva → Nombre: CRM Inmobiliario", "4. URI de redirección: esta URL", "5. Permisos: Sites.ReadWrite.All", "6. Copia el Application (client) ID", "7. Pégalo en CLIENT_ID del código"].map((s, i) => (
+              <div key={i} style={{ fontSize: 10, color: "#9BACC4", marginBottom: 3, lineHeight: 1.4 }}>{s}</div>
+            ))}
+          </div>
+        )}
+      </div>
+      <div style={{ flex: 1, padding: "32px 36px", overflowY: "auto" }}>
+        <Page state={state} dispatch={dispatch} />
+      </div>
+    </div>
+  );
+}
